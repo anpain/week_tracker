@@ -34,7 +34,7 @@
     ```bash
     python3 -m venv venv
     source venv/bin/activate
-    # venv\Scripts\activate
+    venv\Scripts\activate
     ```
 3.  **Установите зависимости:**
     ```bash
