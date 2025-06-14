@@ -2,8 +2,9 @@
 const WEEEK_API_BASE_URL = "https://api.weeek.net/public/v1/";
 const WEEEK_TOKEN_KEY = "WEEEK_API_TOKEN"; 
 const GOOGLE_SHEET_ID_KEY = "GOOGLE_SHEET_ID"; 
-const TARGET_SHEET_NAME_BASE = "Отчет WEEEK";
 const GENERAL_REPORT_SHEET_NAME = "Общий отчет";
+
+const EXCLUDED_EXECUTORS = ["Андрей", "Анастасия"]; 
 
 const PRIORITY_MAP = {0: "Низкий", 1: "Средний", 2: "Высокий", 3: "Замороженный"};
 const PRIORITY_COLORS_GSHEETS = {
@@ -207,6 +208,17 @@ function getContrastTextColor_(hexBackgroundColor) {
   return luma > 0.5 ? TEXT_COLOR_DARK : TEXT_COLOR_LIGHT;
 }
 
+function parseSheetDate_(dateStr) {
+  if (!dateStr || typeof dateStr !== 'string') return null;
+  const parts = dateStr.split('.');
+  if (parts.length !== 3) return null;
+  const day = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1; 
+  const year = parseInt(parts[2], 10);
+  if (isNaN(day) || isNaN(month) || isNaN(year)) return null;
+  return new Date(year, month, day);
+}
+
 // ОБРАБОТКА ТАБЛИЦ
 function processTasksToSheetRows_(allTasks, workspaceMembersMap, boardColumnNamesMap, allProjectsMap, currentWorkspaceId) {
   const sheetRows = []; 
@@ -225,10 +237,10 @@ function processTasksToSheetRows_(allTasks, workspaceMembersMap, boardColumnName
     const taskBoardId = taskItem.boardId != null ? parseInt(taskItem.boardId, 10) : null;
     const taskColumnId = taskItem.boardColumnId != null ? parseInt(taskItem.boardColumnId, 10) : null;
     if (taskBoardId != null && !isNaN(taskBoardId) && taskColumnId != null && !isNaN(taskColumnId)) {
-      statusName = boardColumnNamesMap[`${taskBoardId}_${taskColumnId}`] || String(taskColumnId);
-    } else if (taskColumnId != null && !isNaN(taskColumnId)) {
-      statusName = String(taskColumnId);
-    } else if (taskItem.boardColumnId != null) statusName = String(taskItem.boardColumnId);
+      statusName = boardColumnNamesMap[`${taskBoardId}_${taskColumnId}`] || `Неизвестный статус (ID: ${taskColumnId})`;
+    } else if (taskItem.boardColumnId != null) {
+      statusName = `Неизвестный статус (ID: ${taskItem.boardColumnId})`;
+    }
     
     const creationDate = parseDateStringSafe_(taskItem.createdAt); 
     let completionDate = null;
@@ -238,9 +250,9 @@ function processTasksToSheetRows_(allTasks, workspaceMembersMap, boardColumnName
       else if (taskItem.updatedAt) completionDate = parseDateStringSafe_(taskItem.updatedAt);
     }
     
-    let estimatedValue = (taskItem.duration!=null&&taskItem.duration>0)?Math.ceil(taskItem.duration/60):"##";
+    let estimatedValue = (taskItem.duration!=null&&taskItem.duration>0)? (taskItem.duration/60) : null;
 
-    const baseRowDataForTask = [taskRepresentation,projectName,priorityString,/*executorName*/ statusName,creationDate,completionDate,estimatedValue];
+    const baseRowDataForTask = [taskRepresentation,projectName,priorityString, statusName,creationDate,completionDate,estimatedValue];
     
     const workloads = taskItem.workloads || [];
     if (workloads.length > 0) {
@@ -249,9 +261,8 @@ function processTasksToSheetRows_(allTasks, workspaceMembersMap, boardColumnName
         const workloadExecutorName = workloadUserId ? (workspaceMembersMap[workloadUserId] || workloadUserId) : "";
         const workloadDate = parseDateStringSafe_(workloadEntry.date);
         const durationMinutes = workloadEntry.duration || 0;
-        const trackedHours = durationMinutes > 0 ? Math.ceil(durationMinutes / 60) : null;
-        let commentText = workloadEntry.comment || "";
-        if (commentText.trim() === "") commentText = "НЕТ";
+        const trackedHours = durationMinutes > 0 ? (durationMinutes / 60) : null;
+        const commentText = (workloadEntry.comment || "").trim() || null;
 
         const fullRow = [
             baseRowDataForTask[0], baseRowDataForTask[1], baseRowDataForTask[2], 
@@ -262,15 +273,29 @@ function processTasksToSheetRows_(allTasks, workspaceMembersMap, boardColumnName
         sheetRows.push(fullRow.map(formatValueForSheetCell_));
       });
     } else { 
-      const taskOwnerId = taskItem.userId;
-      const taskOwnerName = taskOwnerId ? (workspaceMembersMap[taskOwnerId] || taskOwnerId) : "";
-      const fullRow = [
-          baseRowDataForTask[0], baseRowDataForTask[1], baseRowDataForTask[2], 
-          taskOwnerName, 
-          baseRowDataForTask[3], baseRowDataForTask[4], baseRowDataForTask[5], baseRowDataForTask[6],
-          null, null, "НЕТ", null, null
-      ];
-      sheetRows.push(fullRow.map(formatValueForSheetCell_));
+      const executorIds = taskItem.executorIds || [];
+      if (executorIds.length > 0) {
+        executorIds.forEach(executorId => {
+          const executorName = executorId ? (workspaceMembersMap[executorId] || executorId) : "";
+          const fullRow = [
+              baseRowDataForTask[0], baseRowDataForTask[1], baseRowDataForTask[2],
+              executorName, 
+              baseRowDataForTask[3], baseRowDataForTask[4], baseRowDataForTask[5], baseRowDataForTask[6],
+              null, null, null, null, null
+          ];
+          sheetRows.push(fullRow.map(formatValueForSheetCell_));
+        });
+      } else {
+        const taskOwnerId = taskItem.userId;
+        const taskOwnerName = taskOwnerId ? (workspaceMembersMap[taskOwnerId] || taskOwnerId) : "";
+        const fullRow = [
+            baseRowDataForTask[0], baseRowDataForTask[1], baseRowDataForTask[2], 
+            taskOwnerName, 
+            baseRowDataForTask[3], baseRowDataForTask[4], baseRowDataForTask[5], baseRowDataForTask[6],
+            null, null, null, null, null
+        ];
+        sheetRows.push(fullRow.map(formatValueForSheetCell_));
+      }
     }
   });
   return sheetRows;
@@ -284,13 +309,6 @@ function getOrCreateSheet_(spreadsheetObject, sheetNameForReport) {
     Logger.log(`Лист '${sheetNameForReport}' создан.`);
   } else {
     Logger.log(`Лист '${sheetNameForReport}' найден. Очистка...`);
-    try {
-      const sheetRangeForMerging = targetSheet.getRange(1, 1, Math.max(1, targetSheet.getMaxRows()), Math.max(1, targetSheet.getMaxColumns()));
-      const mergedRanges = sheetRangeForMerging.getMergedRanges();
-      for (let i = 0; i < mergedRanges.length; i++) mergedRanges[i].breakApart();
-      if (mergedRanges.length > 0) Logger.log(`Разъединено ${mergedRanges.length} диапазонов.`);
-    } catch(e) { Logger.log(`Ошибка при разъединении ячеек: ${e.message}.`); }
-    targetSheet.clearContents().clearFormats(); 
   }
   return targetSheet;
 }
@@ -309,6 +327,11 @@ function updateGoogleSheet_(
     const spreadsheet = SpreadsheetApp.openById(googleSheetFileId);
     const worksheet = getOrCreateSheet_(spreadsheet, targetSheetNameForReport);
     
+    worksheet.clearConditionalFormatRules();
+    const fullSheetRange = worksheet.getRange(1, 1, Math.max(1, worksheet.getMaxRows()), Math.max(1, worksheet.getMaxColumns()));
+    fullSheetRange.clear({contentsOnly: true, formatOnly: true, validationsOnly: true});
+    SpreadsheetApp.flush();
+
     const dataToWriteToSheet = [reportHeadersArray, ...reportDataRows];
     
     const headerMap = {};
@@ -320,36 +343,24 @@ function updateGoogleSheet_(
     const priorityColIdx = headerMap["Приоритет"];
     const statusColIdx = headerMap["Статус"];
     const estimateColIdx = headerMap["Оценка"];
-    const commentColIdx = headerMap["Комментарий к треку"]; 
     const projectColIdx = headerMap["Проект"];
     const executorColIdx = headerMap["Исполнитель"];
     
-    const canCalculateSalary = typeof trackedTimeColIdx === 'number' && 
-                             typeof hourlyRateColIdx === 'number' && 
-                             typeof salaryCalcColIdx === 'number';
-
-    if (!canCalculateSalary) {
-        Logger.log("Не все колонки для формулы ЗП найдены. Формула не будет применена.");
-    }
-
     for (let rowIndex = 1; rowIndex < dataToWriteToSheet.length; rowIndex++) {
         const sheetRowNumber = rowIndex + 1; 
-        if (canCalculateSalary) {
+        if (trackedTimeColIdx > -1 && hourlyRateColIdx > -1 && salaryCalcColIdx > -1) {
             const trackedTimeLetter = convertColumnIndexToLetter_(trackedTimeColIdx + 1);
             const hourlyRateLetter = convertColumnIndexToLetter_(hourlyRateColIdx + 1);
             dataToWriteToSheet[rowIndex][salaryCalcColIdx] = 
-                `=N(${trackedTimeLetter}${sheetRowNumber}) * N(${hourlyRateLetter}${sheetRowNumber})`;
+                `=IFERROR(N(${trackedTimeLetter}${sheetRowNumber}) * N(${hourlyRateLetter}${sheetRowNumber}), "")`;
         }
     }
     
     if (dataToWriteToSheet.length > 0) {
-      const fullRange = worksheet.getRange(1, 1, dataToWriteToSheet.length, reportHeadersArray.length);
-      fullRange.setValues(dataToWriteToSheet); 
-      fullRange.setFontFamily(FONT_FAMILY).setFontSize(10).setVerticalAlignment("middle")
+      const targetRange = worksheet.getRange(1, 1, dataToWriteToSheet.length, reportHeadersArray.length);
+      targetRange.setValues(dataToWriteToSheet); 
+      targetRange.setFontFamily(FONT_FAMILY).setFontSize(10).setVerticalAlignment("middle")
                .setWrapStrategy(SpreadsheetApp.WrapStrategy.WRAP).setBorder(true, true, true, true, true, true, "#BDBDBD", SpreadsheetApp.BorderStyle.SOLID);
-      if (dataToWriteToSheet.length > 1) { 
-           worksheet.getRange(2, 1, dataToWriteToSheet.length - 1, reportHeadersArray.length).setFontWeight(null);
-       }
     }
     SpreadsheetApp.flush(); 
 
@@ -357,109 +368,83 @@ function updateGoogleSheet_(
       .setFontWeight("bold").setFontSize(11).setFontFamily(FONT_FAMILY) 
       .setHorizontalAlignment("center").setBackground(HEADER_BACKGROUND_COLOR).setFontColor(HEADER_FONT_COLOR);
     worksheet.setFrozenRows(1); 
-    SpreadsheetApp.flush();
-
-    let conditionalFormatRules = worksheet.getConditionalFormatRules(); 
+    
+    let conditionalFormatRules = []; 
 
     if (reportDataRows.length > 0) {
-      for (let dataRowIndex = 0; dataRowIndex < reportDataRows.length; dataRowIndex++) {
-        const sheetRowDisplayIndex = dataRowIndex + 2; 
-        const rowRange = worksheet.getRange(sheetRowDisplayIndex, 1, 1, reportHeadersArray.length);
-        if ((dataRowIndex + 1) % 2 === 0) { 
-           rowRange.setBackground("#F0F8FF"); 
-        } else {
-           rowRange.setBackground(null); 
-        }
-      }
-      SpreadsheetApp.flush(); 
+      const dataRowsRange = worksheet.getRange(2, 1, reportDataRows.length, reportHeadersArray.length);
+      dataRowsRange.setFontWeight(null);
+
+      conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenFormulaSatisfied('=MOD(ROW(), 2) = 0').setBackground("#F0F8FF").setRanges([dataRowsRange]).build());
       
-      if (typeof priorityColIdx === 'number' && priorityValuesForDropdown && priorityValuesForDropdown.length > 0) {
+      if (priorityColIdx > -1) {
         const range = worksheet.getRange(2, priorityColIdx + 1, reportDataRows.length, 1);
-        range.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(priorityValuesForDropdown, true).setAllowInvalid(false).build());
+        range.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(priorityValuesForDropdown, true).setAllowInvalid(true).build());
         priorityValuesForDropdown.forEach(priorityText => {
           const bgColor = PRIORITY_COLORS_GSHEETS[priorityText];
           if (bgColor) {
-            const textColor = getContrastTextColor_(bgColor);
-            conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(priorityText).setBackground(bgColor).setFontColor(textColor).setRanges([range]).build());
+            conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(priorityText).setBackground(bgColor).setFontColor(getContrastTextColor_(bgColor)).setRanges([range]).build());
           }
         });
       }
-      if (typeof statusColIdx === 'number' && statusNamesForDropdown && statusNamesForDropdown.length > 0) {
+      if (statusColIdx > -1) {
         const range = worksheet.getRange(2, statusColIdx + 1, reportDataRows.length, 1);
-        range.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(statusNamesForDropdown, true).setAllowInvalid(false).build());
+        range.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(statusNamesForDropdown, true).setAllowInvalid(true).build());
         statusNamesForDropdown.forEach(statusText => {
           const bgColor = STATUS_COLORS_GSHEETS[statusText] || OTHER_STATUS_BACKGROUND_COLOR;
-          const textColor = getContrastTextColor_(bgColor);
-          conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(statusText).setBackground(bgColor).setFontColor(textColor).setRanges([range]).build());
+          conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(statusText).setBackground(bgColor).setFontColor(getContrastTextColor_(bgColor)).setRanges([range]).build());
         });
       }
-       if (typeof projectColIdx === 'number' && projectNamesForDropdown && projectNamesForDropdown.length > 0) {
+      if (projectColIdx > -1) {
         const range = worksheet.getRange(2, projectColIdx + 1, reportDataRows.length, 1);
         range.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(projectNamesForDropdown, true).setAllowInvalid(true).build());
         projectNamesForDropdown.forEach(projectText => { 
           const bgColor = PROJECT_COLORS_GSHEETS[projectText]; 
           if (bgColor) { 
-            const textColor = getContrastTextColor_(bgColor);
-            conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(projectText).setBackground(bgColor).setFontColor(textColor).setRanges([range]).build());
-          } else if (OTHER_PROJECT_BACKGROUND_COLOR) { /* ... */ }
+            conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(projectText).setBackground(bgColor).setFontColor(getContrastTextColor_(bgColor)).setRanges([range]).build());
+          }
         });
       }
-      if (typeof executorColIdx === 'number' && executorNamesForDropdown && executorNamesForDropdown.length > 0) {
+      if (executorColIdx > -1) {
         const range = worksheet.getRange(2, executorColIdx + 1, reportDataRows.length, 1);
         range.setDataValidation(SpreadsheetApp.newDataValidation().requireValueInList(executorNamesForDropdown, true).setAllowInvalid(true).build());
         executorNamesForDropdown.forEach(executorText => {
           const bgColor = EXECUTOR_COLORS_GSHEETS[executorText];
           if (bgColor) {
-            const textColor = getContrastTextColor_(bgColor);
-            conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(executorText).setBackground(bgColor).setFontColor(textColor).setRanges([range]).build());
-          } else if (OTHER_EXECUTOR_BACKGROUND_COLOR) { /* ... */ }
+            conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenTextEqualTo(executorText).setBackground(bgColor).setFontColor(getContrastTextColor_(bgColor)).setRanges([range]).build());
+          }
         });
       }
-      worksheet.setConditionalFormatRules(conditionalFormatRules);
-      SpreadsheetApp.flush();
+      
+      const commentColIdx = headerMap["Комментарий к треку"];
+      if (estimateColIdx > -1) {
+        const range = worksheet.getRange(2, estimateColIdx + 1, reportDataRows.length, 1);
+        conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenCellEmpty().setBackground(ROW_ERROR_BACKGROUND_COLOR).setRanges([range]).build());
+      }
+      if (commentColIdx > -1) {
+        const range = worksheet.getRange(2, commentColIdx + 1, reportDataRows.length, 1);
+        conditionalFormatRules.push(SpreadsheetApp.newConditionalFormatRule().whenCellEmpty().setBackground(ROW_ERROR_BACKGROUND_COLOR).setRanges([range]).build());
+      }
 
+      worksheet.setConditionalFormatRules(conditionalFormatRules);
+      
       reportHeadersArray.forEach((headerName, columnIndexZeroBased) => {
-        const columnDataRange = worksheet.getRange(2, columnIndexZeroBased + 1, reportDataRows.length, 1);
-        if (headerName === "Задача" || headerName === "Комментарий к треку" || headerName === "Проект") { 
-          columnDataRange.setHorizontalAlignment("left");
-        } else if (headerName === "Оценка" || headerName === "Затреканное время" || headerName === "Стоимость в час" || headerName === "Расчет зп") {
-           columnDataRange.setHorizontalAlignment("right"); 
-        } else {
-          columnDataRange.setHorizontalAlignment("center");
+        const columnRange = worksheet.getRange(2, columnIndexZeroBased + 1, reportDataRows.length, 1);
+        switch(headerName) {
+            case "Задача": case "Комментарий к треку": case "Проект":
+                columnRange.setHorizontalAlignment("left"); break;
+            case "Стоимость в час": case "Расчет зп":
+                columnRange.setHorizontalAlignment("right"); break;
+            default: columnRange.setHorizontalAlignment("center");
         }
         
-        if (headerName === "Оценка" && typeof estimateColIdx === 'number') {
-           reportDataRows.forEach((dataRowArray, rowIndexZeroBased) => {
-             if (String(dataRowArray[estimateColIdx]) === "##") { 
-                const cellToFormat = worksheet.getRange(rowIndexZeroBased + 2, estimateColIdx + 1);
-                if (cellToFormat.getBackground() !== ESTIMATE_MISSING_BACKGROUND_COLOR) {
-                    cellToFormat.setBackground(ESTIMATE_MISSING_BACKGROUND_COLOR);
-                    cellToFormat.setFontColor(getContrastTextColor_(ESTIMATE_MISSING_BACKGROUND_COLOR));
-                }
-             }
-           });
-        }
-        if (headerName === "Комментарий к треку" && typeof commentColIdx === 'number') {
-           reportDataRows.forEach((dataRowArray, rowIndexZeroBased) => {
-             const commentValue = String(dataRowArray[commentColIdx]); 
-             if (commentValue.toUpperCase() === "НЕТ") { 
-                const cellToFormat = worksheet.getRange(rowIndexZeroBased + 2, commentColIdx + 1);
-                cellToFormat.setBackground(ROW_ERROR_BACKGROUND_COLOR); 
-                cellToFormat.setFontColor(getContrastTextColor_(ROW_ERROR_BACKGROUND_COLOR));
-             }
-           });
-        }
-
-        if (headerName === "Расчет зп") columnDataRange.setNumberFormat("0.00");
-        else if (headerName === "Оценка" || headerName === "Затреканное время") {
-             reportDataRows.forEach((dataRowArray, rowIndexZeroBased) => {
-                 if (String(dataRowArray[columnIndexZeroBased]) !== "##") { 
-                     worksheet.getRange(rowIndexZeroBased + 2, columnIndexZeroBased + 1).setNumberFormat("0");
-                 }
-             });
+        switch(headerName) {
+            case "Расчет зп": case "Затреканное время": case "Оценка":
+                columnRange.setNumberFormat("0.00"); break;
+            case "Стоимость в час":
+                columnRange.setNumberFormat("0"); break;
         }
       });
-      SpreadsheetApp.flush();
     }
     
     const columnWidthsSettings = { 
@@ -471,20 +456,15 @@ function updateGoogleSheet_(
     reportHeadersArray.forEach((headerName, colIndexZeroBased) => {
         const columnIndexOneBased = colIndexZeroBased + 1;
         try {
-            if (columnWidthsSettings[headerName]) {
-                worksheet.setColumnWidth(columnIndexOneBased, columnWidthsSettings[headerName]);
-            } else if (headerName !== "Задача" && headerName !== "Комментарий к треку" && headerName !== "Проект") {
-                worksheet.autoResizeColumn(columnIndexOneBased); 
-            }
+            if (columnWidthsSettings[headerName]) worksheet.setColumnWidth(columnIndexOneBased, columnWidthsSettings[headerName]);
+            else worksheet.autoResizeColumn(columnIndexOneBased); 
         } catch (e) {
              Logger.log(`Не удалось изменить размер колонки '${headerName}': ${e.message}. Пропуск.`);
         }
     });
-
     Logger.log("Данные успешно записаны и отформатированы.");
-
   } catch (error) { 
-    Logger.log(`Ошибка при работе: ${error}. Stack: ${error.stack}`); 
+    Logger.log(`Ошибка при работе с листом '${targetSheetNameForReport}': ${error.message}. Stack: ${error.stack}`); 
     throw error; 
   }
 }
@@ -510,12 +490,12 @@ function runFullReportGeneration() {
     const { workspaceId, membersMap, tasksData, boardColumnNamesMap, allProjectsMap } = fetchWeeekData_(weeekApiToken);
 
     if (workspaceId === null) {
-        Logger.log("ПРЕДУПРЕЖДЕНИЕ: Не удалось получить ID рабочего пространства WEEEK. URL задач могут быть неполными или отсутствовать.");
+        Logger.log("ПРЕДУПРЕЖДЕНИЕ: Не удалось получить ID рабочего пространства WEEEK. URL задач могут быть неполными.");
     }
 
     let allProcessedSheetRows = [];
     if (!tasksData || tasksData.length === 0) {
-      Logger.log("Задачи не загружены. Отчеты будут содержать только заголовки (если применимо).");
+      Logger.log("Задачи не загружены.");
     } else {
       allProcessedSheetRows = processTasksToSheetRows_(
         tasksData, membersMap, boardColumnNamesMap, allProjectsMap, workspaceId 
@@ -528,94 +508,94 @@ function runFullReportGeneration() {
         "Дата трека", "Затреканное время", "Комментарий к треку",
         "Стоимость в час", "Расчет зп"
     ];
+    
+    const dateTrackColIdx = reportHeaders.indexOf("Дата трека");
+    if (allProcessedSheetRows.length > 0 && dateTrackColIdx !== -1) {
+      Logger.log("Сортировка задач по дате трека...");
+      allProcessedSheetRows.sort((a, b) => {
+        const dateA = parseSheetDate_(a[dateTrackColIdx]);
+        const dateB = parseSheetDate_(b[dateTrackColIdx]);
+        if (!dateA && !dateB) return 0;
+        if (!dateA) return -1;
+        if (!dateB) return 1;
+        return dateA - dateB;
+      });
+    }
 
     const uniqueProjectNames = [...new Set(Object.values(allProjectsMap).filter(name => name))].sort();
     const priorityValues = Object.values(PRIORITY_MAP);
     const allUniqueExecutorNames = [...new Set(Object.values(membersMap).filter(name => name))].sort();
-    const uniqueStatusNames = [...new Set(Object.values(boardColumnNamesMap).filter(name => name))].sort();
+    
+    const statusColIdx = reportHeaders.indexOf("Статус");
+    const uniqueStatusNamesFromData = statusColIdx > -1 ? [...new Set(allProcessedSheetRows.map(row => row[statusColIdx]).filter(Boolean))] : [];
+    const uniqueStatusNamesFromAPI = [...new Set(Object.values(boardColumnNamesMap).filter(Boolean))];
+    const comprehensiveStatusNames = [...new Set([...uniqueStatusNamesFromAPI, ...uniqueStatusNamesFromData])].sort();
 
-    // СОЗДАНИЕ ОБЩЕГО ЛИСТА
     Logger.log(`Создание '${GENERAL_REPORT_SHEET_NAME}'...`);
     updateGoogleSheet_(
         googleSheetFileId, GENERAL_REPORT_SHEET_NAME, reportHeaders, allProcessedSheetRows,
-        uniqueProjectNames, priorityValues, allUniqueExecutorNames, uniqueStatusNames
+        uniqueProjectNames, priorityValues, allUniqueExecutorNames, comprehensiveStatusNames
     );
-    Logger.log(`Лист '${GENERAL_REPORT_SHEET_NAME}' создан/обновлен (строк данных: ${allProcessedSheetRows.length}).`);
-    Utilities.sleep(1000); 
+    Logger.log(`Лист '${GENERAL_REPORT_SHEET_NAME}' создан/обновлен.`);
+    Utilities.sleep(1500); 
 
-    // Определяем периоды
+    Logger.log("Группировка задач для отчетов по исполнителям и периодам...");
+    const reportsBySheetName = {}; 
+    
     const [reportingPeriod1, reportingPeriod2] = getReportingPeriods_(currentDate);
-    const [p1StartDate, p1EndDate] = reportingPeriod1; 
-    const [p2StartDate, p2EndDate] = reportingPeriod2; 
-
     const periodsToProcess = [
-      { nameSuffix: `(${Utilities.formatDate(p1StartDate, Session.getScriptTimeZone(), "dd.MM")}-${Utilities.formatDate(p1EndDate, Session.getScriptTimeZone(), "dd.MM")})`, 
-        start: p1StartDate, end: p1EndDate },
-      { nameSuffix: `(${Utilities.formatDate(p2StartDate, Session.getScriptTimeZone(), "dd.MM")}-${Utilities.formatDate(p2EndDate, Session.getScriptTimeZone(), "dd.MM")})`, 
-        start: p2StartDate, end: p2EndDate }
+      { name: `(${Utilities.formatDate(reportingPeriod1[0], Session.getScriptTimeZone(), "dd.MM")}-${Utilities.formatDate(reportingPeriod1[1], Session.getScriptTimeZone(), "dd.MM")})`, start: reportingPeriod1[0], end: reportingPeriod1[1] },
+      { name: `(${Utilities.formatDate(reportingPeriod2[0], Session.getScriptTimeZone(), "dd.MM")}-${Utilities.formatDate(reportingPeriod2[1], Session.getScriptTimeZone(), "dd.MM")})`, start: reportingPeriod2[0], end: reportingPeriod2[1] }
     ];
-    
-    const dateTrackColIdx = reportHeaders.indexOf("Дата трека");
-    const executorColIdx = reportHeaders.indexOf("Исполнитель");
 
-    // Создание листов по исполнителям и периодам ---
-    Logger.log("Создание отчетов по исполнителям и периодам...");
-    
-    const excludedExecutorNames = ["Андрей", "Анастасия"]; 
-    const targetExecutors = allUniqueExecutorNames.filter(name => 
-        !excludedExecutorNames.some(excluded => name.toLowerCase() === excluded.toLowerCase())
-    );
-    const executorsForSheets = targetExecutors.slice(0, 3); 
-    Logger.log(`Будут созданы отчеты для исполнителей: ${executorsForSheets.join(', ') || 'нет подходящих'}`);
-    
-    if (executorsForSheets.length > 0) {
-        for (const executorName of executorsForSheets) {
-          for (const period of periodsToProcess) {
-            Logger.log(`Формирование отчета для: ${executorName} - Период: ${period.nameSuffix}`);
-            let sheetNameForExecutorPeriod = `${executorName} ${period.nameSuffix}`;
-            sheetNameForExecutorPeriod = sheetNameForExecutorPeriod.replace(/[\[\]\*\/\\\?\:]/g, "").substring(0, 95);
-            let rowsForExecutorAndPeriod = [];
-            if (allProcessedSheetRows.length > 0 && typeof executorColIdx === 'number' && executorColIdx !== -1 && typeof dateTrackColIdx === 'number' && dateTrackColIdx !== -1) {
-                rowsForExecutorAndPeriod = allProcessedSheetRows.filter(row => { 
-                    const rowExecutor = typeof row[executorColIdx] === 'string' ? row[executorColIdx].toLowerCase() : "";
-                    const isCorrectExecutor = rowExecutor === executorName.toLowerCase();
-                    if (!isCorrectExecutor) return false;
-                    const trackDateStr = row[dateTrackColIdx]; 
-                    if (!trackDateStr || typeof trackDateStr !== 'string') return false;
-                    const parts = trackDateStr.split('.');
-                    if (parts.length === 3) {
-                        const day = parseInt(parts[0],10); const month = parseInt(parts[1],10)-1; const year = parseInt(parts[2],10);
-                        if (!isNaN(day) && !isNaN(month) && !isNaN(year)) {
-                            const trackDate = new Date(year, month, day); trackDate.setHours(0,0,0,0);
-                            const periodStartNorm = new Date(period.start); periodStartNorm.setHours(0,0,0,0);
-                            const periodEndNorm = new Date(period.end); periodEndNorm.setHours(0,0,0,0);
-                            return trackDate >= periodStartNorm && trackDate <= periodEndNorm;
-                        }
-                    }
-                    return false; 
-                });
-            } else if (allProcessedSheetRows.length > 0 && typeof executorColIdx === 'number' && executorColIdx !== -1) {
-                 rowsForExecutorAndPeriod = allProcessedSheetRows.filter(row => (typeof row[executorColIdx] === 'string' && row[executorColIdx].toLowerCase() === executorName.toLowerCase()));
-            }
-            updateGoogleSheet_(googleSheetFileId, sheetNameForExecutorPeriod, reportHeaders, rowsForExecutorAndPeriod, uniqueProjectNames, priorityValues, allUniqueExecutorNames, uniqueStatusNames);
-            Logger.log(`Отчет '${sheetNameForExecutorPeriod}' создан.`);
-            Utilities.sleep(1500); 
+    const executorColIdx = reportHeaders.indexOf("Исполнитель");
+    const excludedExecutorsLower = EXCLUDED_EXECUTORS.map(name => name.toLowerCase());
+
+    if (allProcessedSheetRows.length > 0 && executorColIdx !== -1 && dateTrackColIdx !== -1) {
+      allProcessedSheetRows.forEach(row => {
+        const executorName = row[executorColIdx];
+        if (!executorName || typeof executorName !== 'string' || excludedExecutorsLower.includes(executorName.toLowerCase())) return;
+
+        const trackDate = parseSheetDate_(row[dateTrackColIdx]);
+        if (!trackDate) return;
+        trackDate.setHours(0,0,0,0);
+
+        for (const period of periodsToProcess) {
+          const periodStartNorm = new Date(period.start); periodStartNorm.setHours(0,0,0,0);
+          const periodEndNorm = new Date(period.end); periodEndNorm.setHours(0,0,0,0);
+
+          if (trackDate >= periodStartNorm && trackDate <= periodEndNorm) {
+            let sheetName = `${executorName} ${period.name}`.replace(/[\[\]\*\/\\\?\:]/g, "").substring(0, 95);
+            if (!reportsBySheetName[sheetName]) reportsBySheetName[sheetName] = [];
+            reportsBySheetName[sheetName].push(row);
+            break; 
           }
         }
-    } else {
-        Logger.log("Нет исполнителей для создания отдельных отчетов по периодам после фильтрации.");
+      });
     }
-    Logger.log("Завершено создание отчетов по исполнителям и периодам.");
+    
+    Logger.log(`Начинаю создание ${Object.keys(reportsBySheetName).length} отчетов по исполнителям...`);
+    const sortedSheetNames = Object.keys(reportsBySheetName).sort();
+    for (const sheetName of sortedSheetNames) {
+      const rowsForSheet = reportsBySheetName[sheetName];
+      Logger.log(`Создание отчета '${sheetName}' с ${rowsForSheet.length} строками...`);
+      updateGoogleSheet_(
+        googleSheetFileId, sheetName, reportHeaders, rowsForSheet,
+        uniqueProjectNames, priorityValues, allUniqueExecutorNames, comprehensiveStatusNames
+      );
+      Utilities.sleep(1500); 
+    }
 
+    Logger.log("Завершено создание отчетов по исполнителям и периодам.");
     finalLogMessageOverall = `Все отчеты WEEEK успешно сгенерированы!`;
     overallOperationSucceeded = true; 
     
   } catch (error) {
-    if (!finalLogMessageOverall) finalLogMessageOverall = `Произошла глобальная ошибка: ${error.message}.`;
+    finalLogMessageOverall = `Произошла глобальная ошибка: ${error.message}.`;
     Logger.log(`КРИТИЧЕСКАЯ ОШИБКА при генерации отчетов: ${error}. Stack: ${error.stack ? error.stack : 'недоступно'}`);
     overallOperationSucceeded = false; 
   } finally {
-    const finalStatus = overallOperationSucceeded ? "УСПЕХ" : "ОШИБКА/ПРЕДУПРЕЖДЕНИЕ";
-    Logger.log(`ЗАВЕРШЕНИЕ ВСЕХ ОПЕРАЦИЙ: ${finalStatus}. Итоговое сообщение: ${finalLogMessageOverall || (overallOperationSucceeded ? 'Все операции завершены успешно.' : 'Произошла неизвестная ошибка или нет данных для обработки.')}`);
+    const finalStatus = overallOperationSucceeded ? "УСПЕХ" : "ОШИБКА";
+    Logger.log(`ЗАВЕРШЕНИЕ ВСЕХ ОПЕРАЦИЙ: ${finalStatus}. Итоговое сообщение: ${finalLogMessageOverall}`);
   }
 }
